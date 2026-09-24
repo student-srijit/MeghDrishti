@@ -187,3 +187,22 @@ HAIL_LIGHTNING_PROB_MIN = 0.30
 DOWNBURST_VELOCITY_DELTA_MS = 25.0
 
 INGEST_CYCLE_MINUTES = 15
+
+# Twilio SMS alerts — last-mile notification for farmers/local administration
+# (explicitly called out in the problem statement) when a real "high"
+# severity hazard is detected. Off by default like every other USE_LIVE_*
+# flag; needs a real Twilio account (free trial works) — see
+# nowcast/alerts/sms_alerts.py.
+USE_LIVE_ALERTS = os.getenv("USE_LIVE_ALERTS", "false").lower() == "true"
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
+TWILIO_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER", "")
+# Comma-separated E.164 numbers, e.g. "+919812345678,+919898765432".
+ALERT_TO_NUMBERS = [n.strip() for n in os.getenv("ALERT_TO_NUMBERS", "").split(",") if n.strip()]
+# Minimum severity that triggers an SMS — "high" only by default, so a
+# fresh live radar cycle every ~3min doesn't spam the same ongoing storm.
+ALERT_MIN_SEVERITY = os.getenv("ALERT_MIN_SEVERITY", "high")
+# Once a district has been alerted, don't alert it again for this many
+# minutes even if new high-severity hazards keep appearing there — an
+# active storm easily spans several ingest cycles.
+ALERT_COOLDOWN_MINUTES = int(os.getenv("ALERT_COOLDOWN_MINUTES", "60"))

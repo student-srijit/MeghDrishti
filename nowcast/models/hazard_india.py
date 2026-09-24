@@ -47,6 +47,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 from nowcast.configs.settings import INDIA_BBOX, HAIL_REFLECTIVITY_MIN_DBZ
+from nowcast.configs.districts_india import nearest_districts_vectorized
 
 INDIA_GRID_SIZE = 150  # ~0.2deg/cell, ~22km — fine enough for a country overview
 LIGHTNING_PROXIMITY_KM = 25.0  # collocated-with-lightning bumps hail severity up a tier
@@ -173,6 +174,19 @@ def detect(reflectivity=None, strikes=None):
 
     for h in hazards:
         h["source"] = "real"
+
+    # District/state labels (judges think in districts, not grid cells —
+    # see districts_india.py for what "nearest centroid" actually means
+    # here). Vectorized across every hazard point at once rather than a
+    # per-point lookup loop, same reasoning as the lightning-proximity
+    # vectorization above.
+    if hazards:
+        district_labels = nearest_districts_vectorized(
+            [h["lat"] for h in hazards], [h["lon"] for h in hazards]
+        )
+        for h, label in zip(hazards, district_labels):
+            h["district"] = label["district"]
+            h["state"] = label["state"]
 
     return hazards
 

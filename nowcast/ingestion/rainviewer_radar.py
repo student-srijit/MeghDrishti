@@ -62,29 +62,27 @@ def _decode_dbz(png_bytes):
     return np.clip(dbz, 0, None)
 
 
-def _latest_frame_path():
+def _weather_maps():
     resp = requests.get("https://api.rainviewer.com/public/weather-maps.json", timeout=10)
     resp.raise_for_status()
     data = resp.json()
-    host = data["host"]
     past_frames = data["radar"]["past"]
     if not past_frames:
         raise RuntimeError("RainViewer returned no past radar frames")
+    return data["host"], past_frames
+
+
+def _latest_frame_path():
+    host, past_frames = _weather_maps()
     return host, past_frames[-1]["path"]  # most recent
 
 
-def fetch_reflectivity(grid_size=64, bbox=None, zoom=None):
-    """Real reflectivity grid over `bbox` (defaults to the active region's
-    storm-scale bbox), regridded to (grid_size, grid_size). Pass a coarser
-    `zoom` for a large bbox (see INDIA_ZOOM / fetch_india_reflectivity) —
-    tile count grows with (bbox extent / tile extent)^2, and ZOOM=10's
-    ~0.35deg tiles would mean thousands of requests across all of India."""
-    if bbox is None:
-        bbox = get_region_bbox()
-    if zoom is None:
-        zoom = ZOOM
-    host, frame_path = _latest_frame_path()
-
+def _fetch_frame_mosaic(host, frame_path, bbox, grid_size, zoom):
+    """One RainViewer frame (`frame_path`, a specific past timestamp — not
+    necessarily the latest), fetched as tiles, mosaicked, and regridded to
+    (grid_size, grid_size) over `bbox`. Factored out of fetch_reflectivity
+    so fetch_reflectivity_sequence can call it once per historical frame
+    without duplicating the tile/mosaic/regrid logic."""
     lon_min, lat_min, lon_max, lat_max = bbox
     x_min, y_max = _latlon_to_tile(lat_min, lon_min, zoom)  # smaller lat -> larger y
     x_max, y_min = _latlon_to_tile(lat_max, lon_max, zoom)
@@ -148,6 +146,20 @@ def fetch_reflectivity(grid_size=64, bbox=None, zoom=None):
     return interp(pts).reshape(dst_lat_grid.shape).astype(np.float32)
 
 
+def fetch_reflectivity(grid_size=64, bbox=None, zoom=None):
+    """Real reflectivity grid over `bbox` (defaults to the active region's
+    storm-scale bbox), regridded to (grid_size, grid_size). Pass a coarser
+    `zoom` for a large bbox (see INDIA_ZOOM / fetch_india_reflectivity) —
+    tile count grows with (bbox extent / tile extent)^2, and ZOOM=10's
+    ~0.35deg tiles would mean thousands of requests across all of India."""
+    if bbox is None:
+        bbox = get_region_bbox()
+    if zoom is None:
+        zoom = ZOOM
+    host, frame_path = _latest_frame_path()
+    return _fetch_frame_mosaic(host, frame_path, bbox, grid_size, zoom)
+
+
 def fetch_india_reflectivity(grid_size):
     """Real reflectivity across all of India (settings.INDIA_BBOX), at a
     coarser zoom than the per-region fetch — used by hazard_india.py."""
@@ -156,6 +168,52 @@ def fetch_india_reflectivity(grid_size):
     return fetch_reflectivity(grid_size=grid_size, bbox=INDIA_BBOX, zoom=INDIA_ZOOM)
 
 
+def fetch_reflectivity_sequence(n_frames=6, grid_size=64, bbox=None, zoom=None):
+    """Real reflectivity TIME SERIES from RainViewer's own history buffer —
+    the input pySTEPS actually needs (a single "now" frame has no motion to
+    estimate). `weather-maps.json`'s `radar.past` list already holds the
+    last ~2h of frames at ~10min cadence; this fetches the most recent
+    `n_frames` of them (oldest first) and regrids each the same way
+    fetch_reflectivity does for one frame.
+
+    Returns (stack, dt_minutes_list) where `stack` is (T, grid_size,
+    grid_size) float32 dBZ, oldest frame first, and `dt_minutes_list` is
+    the real elapsed minutes between each consecutive pair of frames
+    (RainViewer's cadence is usually but not guaranteed to be exactly
+    10min, so this is measured from each frame's actual `time` field
+    rather than assumed).
+    """
+    if bbox is None:
+        bbox = get_region_bbox()
+    if zoom is None:
+        zoom = ZOOM
+    host, past_frames = _weather_maps()
+    if len(past_frames) < 2:
+        raise RuntimeError(
+            f"RainViewer only has {len(past_frames)} past frame(s) right now — need >=2 for a motion estimate"
+        )
+    chosen = past_frames[-n_frames:] if len(past_frames) >= n_frames else past_frames
+
+    frames = [_fetch_frame_mosaic(host, f["path"], bbox, grid_size, zoom) for f in chosen]
+    times = [f["time"] for f in chosen]  # unix seconds, ascending (oldest first)
+    dt_minutes_list = [(times[i + 1] - times[i]) / 60.0 for i in range(len(times) - 1)]
+    return np.stack(frames, axis=0), dt_minutes_list
+
+
+def fetch_india_reflectivity_sequence(n_frames=6, grid_size=150):
+    """All-India equivalent of fetch_reflectivity_sequence, for a real
+    all-India pySTEPS cloudburst extrapolation (was previously impossible —
+    see hazard_india.py's docstring — because only a single "now" mosaic
+    was ever fetched; this fetches `n_frames` all-India mosaics instead).
+    Several times the cost of a single all-India fetch (~15s each), so
+    callers should cache aggressively."""
+    from nowcast.configs.settings import INDIA_BBOX
+
+    return fetch_reflectivity_sequence(n_frames=n_frames, grid_size=grid_size, bbox=INDIA_BBOX, zoom=INDIA_ZOOM)
+
+
 if __name__ == "__main__":
     grid = fetch_reflectivity()
     print(f"reflectivity_dbz: min={grid.min():.1f} max={grid.max():.1f} mean={grid.mean():.1f}")
+    stack, dts = fetch_reflectivity_sequence()
+    print(f"sequence: {stack.shape[0]} frames, dt_minutes={[round(d, 1) for d in dts]}")

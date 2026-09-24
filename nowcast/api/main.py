@@ -25,11 +25,14 @@ from nowcast.configs.settings import (
     INGEST_CYCLE_MINUTES,
     CLOUDBURST_RAIN_RATE_MM_HR,
     REGIONS,
+    ALERT_MIN_SEVERITY,
+    ALERT_COOLDOWN_MINUTES,
     get_active_region_key,
     get_region_name,
     set_active_region,
     override_active_region,
 )
+from nowcast.configs.districts_india import DISTRICTS
 from nowcast.ingestion.imd_nowcast import pull as pull_imd
 from nowcast.ingestion.satellite_insat import pull as pull_satellite
 from nowcast.ingestion.radar_puller import pull as pull_radar
@@ -39,6 +42,10 @@ from nowcast.models.eta import storm_cells
 from nowcast.models.pysteps_baseline import run_forecast, cloudburst_cells
 from nowcast.processing.fusion import build_fused_frame, list_imd_timestamps, build_fused_frame_for_timestamp
 from nowcast.processing import weather_fields
+from nowcast.alerts import sms_alerts
+
+_SEVERITY_RANK = {"low": 0, "moderate": 1, "high": 2}
+_DISTRICT_CENTROIDS = {name: (lat, lon) for name, _state, lat, lon in DISTRICTS}
 
 app = FastAPI(title="MeghDrishti Nowcast API")
 app.add_middleware(
@@ -75,6 +82,75 @@ _SNAPSHOT_FRESH_SECONDS = INGEST_CYCLE_MINUTES * 60 * 2
 # every /hazards or /raw-layers call.
 _india_hazards_cache = {"hazards": [], "reflectivity": None, "computed_at": 0, "error": None}
 _INDIA_HAZARDS_TTL_SECONDS = 180
+
+# district_key ("District, State") -> unix timestamp of the last SMS sent
+# for that district — see _maybe_send_alerts. Purely in-memory, resets on
+# restart; fine for a hackathon-timescale demo.
+_alert_cooldowns = {}
+
+
+def _district_risk_summary(hazards):
+    """Aggregate the real, point-level hazard list into one risk rollup per
+    district (judges think in districts, not grid cells) — count of
+    hail/lightning hits and the highest severity seen, per district.
+    Districts with zero hazards right now are simply absent from the
+    output (an empty list is the true state, not something to pad out to
+    all ~130 known centroids)."""
+    by_district = {}
+    for h in hazards:
+        key = (h.get("district"), h.get("state"))
+        if key not in by_district:
+            lat, lon = _DISTRICT_CENTROIDS.get(h["district"], (h["lat"], h["lon"]))
+            by_district[key] = {
+                "district": h.get("district"),
+                "state": h.get("state"),
+                "lat": lat,
+                "lon": lon,
+                "hail_count": 0,
+                "lightning_count": 0,
+                "max_severity": "low",
+            }
+        entry = by_district[key]
+        if h["type"] == "hail":
+            entry["hail_count"] += 1
+        elif h["type"] == "lightning":
+            entry["lightning_count"] += 1
+        if _SEVERITY_RANK[h["severity"]] > _SEVERITY_RANK[entry["max_severity"]]:
+            entry["max_severity"] = h["severity"]
+
+    summary = list(by_district.values())
+    summary.sort(key=lambda d: (_SEVERITY_RANK[d["max_severity"]], d["hail_count"] + d["lightning_count"]), reverse=True)
+    return summary
+
+
+def _maybe_send_alerts(district_summary):
+    """Twilio SMS to ALERT_TO_NUMBERS for any district whose rollup just hit
+    ALERT_MIN_SEVERITY (default "high") and isn't still in its post-alert
+    cooldown window — last-mile notification for farmers/local
+    administration, called out explicitly in the problem statement. Never
+    allowed to raise into the caller: a Twilio outage or misconfiguration
+    should not affect hazard detection itself."""
+    if not sms_alerts.configured():
+        return
+    now = time.time()
+    threshold_rank = _SEVERITY_RANK[ALERT_MIN_SEVERITY]
+    for entry in district_summary:
+        if _SEVERITY_RANK[entry["max_severity"]] < threshold_rank:
+            continue
+        key = f"{entry['district']}, {entry['state']}"
+        last_sent = _alert_cooldowns.get(key, 0)
+        if now - last_sent < ALERT_COOLDOWN_MINUTES * 60:
+            continue
+        hazard_type = "hail" if entry["hail_count"] >= entry["lightning_count"] else "lightning"
+        detail = f"{entry['hail_count']} hail + {entry['lightning_count']} lightning detection(s) nearby."
+        body = sms_alerts.format_hazard_alert(entry["district"], entry["state"], hazard_type, entry["max_severity"], detail)
+        try:
+            sent = sms_alerts.send_sms(body)
+            if sent:
+                _alert_cooldowns[key] = now
+                print(f"[api] sent hazard alert for {key} to {len(sent)} number(s)")
+        except Exception as exc:
+            print(f"[api] alert send failed for {key}: {exc}")
 
 
 def _refresh_dgmr():
@@ -445,7 +521,7 @@ def forecast(model: str = Query("pysteps", pattern="^(pysteps|dgmr)$")):
         "max_rainrate_mm_hr": [round(float(f.max()), 1) for f in fc["rainrate_forecast"]],
         "mean_rainrate_mm_hr": [round(float(f.mean()), 2) for f in fc["rainrate_forecast"]],
         "bbox": fc["bbox"],
-        "source": "pysteps-synthetic",
+        "source": f"pysteps-{fc.get('source', 'synthetic')}",
     }
 
 
@@ -497,7 +573,7 @@ def nowcast_frame(
     frame = fc["rainrate_forecast"][idx]
     image = _array_to_png_data_url(frame, "turbo", vmin=0, vmax=65)
     return {"available": True, "image": image, "bbox": fc["bbox"],
-            "lead_minutes": fc["timestamps_min"][idx], "source": "pysteps"}
+            "lead_minutes": fc["timestamps_min"][idx], "source": f"pysteps-{fc.get('source', 'synthetic')}"}
 
 
 @app.get("/raw-layers")
