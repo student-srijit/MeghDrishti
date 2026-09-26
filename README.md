@@ -1,173 +1,442 @@
-# MeghDrishti
+﻿# MeghDrishti
 
-Convective-scale nowcasting system (SIH 2026) — 0-6h thunderstorm/hail/downburst/cloudburst
-nowcasting fusing IMD radar, INSAT satellite, and lightning data on a GIS dashboard.
-Full plan: [`project.md`](project.md). One-page write-up: [`WRITEUP.md`](WRITEUP.md).
+![Python](https://img.shields.io/badge/python-3.11-3776AB.svg?style=for-the-badge&logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-009688.svg?style=for-the-badge&logo=fastapi&logoColor=white)
+![React](https://img.shields.io/badge/React-61DAFB.svg?style=for-the-badge&logo=react&logoColor=black)
+![TypeScript](https://img.shields.io/badge/TypeScript-3178C6.svg?style=for-the-badge&logo=typescript&logoColor=white)
+![PyTorch](https://img.shields.io/badge/PyTorch-EE4C2C.svg?style=for-the-badge&logo=pytorch&logoColor=white)
+![MapLibre](https://img.shields.io/badge/MapLibre-396CB2.svg?style=for-the-badge&logo=maplibre&logoColor=white)
 
-## Current status — Definition of Done (§8) satisfied
+<p align="center">
+  <img src="logo.png" width="200px" alt="MeghDrishti Logo"/>
+</p>
 
-**The dashboard's default hazard view is real and country-wide, not a demo storm near one
-city.** `/hazards` (`nowcast/models/hazard_india.py`) detects real hail and lightning
-across all of India right now, straight from RainViewer reflectivity + Blitzortung
-strikes — no synthetic storm, no fixed demo city. `/raw-layers`' radar overlay is the same
-all-India RainViewer fetch. Downburst and cloudburst have no real all-India equivalent
-(no public Doppler-velocity source anywhere, and no persisted real radar time-series for
-pySTEPS to forecast from) and are intentionally absent from this view rather than faked at
-country scale — see `hazard_india.py`'s docstring. The original per-region demo (all 4
-hazard types, downburst/cloudburst synthetic-backed, for whichever of the 10 cities is
-picked via "Demo region") still exists underneath and now lives at `/hazards/region`,
-still driving the Forecast/Replay pages' pySTEPS/DGMR features.
+<p align="center">
+  <b>Convective-scale nowcasting system (SIH 2026)</b><br/>
+  Real-time 0-6h thunderstorm, hail, downburst and cloudburst prediction fusing IMD radar, INSAT satellite, and Blitzortung lightning data on a live GIS dashboard.
+</p>
 
-MOSDAC/IMD *nowcast API* registration is still under review (see Next steps) — while
-waiting, every hazard input has been replaced with **another free, real data source**
-except radar's Doppler velocity (needed for the downburst rule — no public aggregator
-publishes raw volumetric scans, so downburst stays fully synthetic). Every real source
-below is opt-in via a `USE_LIVE_*` flag in `.env` (copy from `.env.example`) and falls
-back to synthetic automatically if the live fetch fails.
+---
 
-- **Ingestion (2a/2b/2c)**: `nowcast/ingestion/{imd_nowcast,satellite_insat,radar_puller}.py`
-  — `imd_nowcast.py` has a real live path via Tomorrow.io's realtime weather API
-  (`USE_LIVE_IMD=true` + `TOMORROW_API_KEY`) for real temperature/humidity/wind/precip at
-  the demo stations. Real lightning strikes are layered on top independently via
-  Blitzortung.org (`USE_LIVE_LIGHTNING=true`, no key needed — see
-  `nowcast/ingestion/blitzortung_lightning.py`), a free community VLF detection network,
-  since neither IMD nor Tomorrow.io expose a lightning field. Radar reflectivity is real
-  via RainViewer (`USE_LIVE_RADAR=true`, no key needed — see
-  `nowcast/ingestion/rainviewer_radar.py`): its "Black and White" tile scheme is a direct
-  greyscale-to-dBZ encoding, not a rendered color guess, and its India coverage is itself
-  IMD's public radar network republished by a third party. `fetch_india_reflectivity()`
-  fetches it across the whole country (tiles fanned out concurrently, ~3s) for the default
-  hazard view and `/raw-layers`; `fetch_reflectivity()` still serves the smaller per-region
-  demo bbox. Radial velocity (downburst) stays synthetic even with radar live, since no
-  public source exposes it. Satellite is
-  real via two sources (`USE_LIVE_SATELLITE=true`, each needs its own free account):
-  EUMETSAT MSG SEVIRI (`nowcast/ingestion/eumetsat_satellite.py`, `EUMETSAT_CONSUMER_KEY`/
-  `SECRET`) is tried first — geostationary, continuous coverage — but currently blocked
-  by a `403` pending EUMETSAT-side license propagation (account registered, license
-  accepted, still 403 — see module docstring), so it falls back to Copernicus Sentinel-3
-  SLSTR
-  (`nowcast/ingestion/copernicus_satellite.py`, `COPERNICUS_CLIENT_ID`/`SECRET`, verified
-  live) if unconfigured or it fails. `wv`/`mwir` stay synthetic regardless (neither source
-  has equivalent channels), and Sentinel-3 being polar-orbiting means frequent "no recent
-  scene" fallbacks to synthetic are expected there, not a bug. Each puller runs
-  independently; one failing doesn't block the others (`_ingest_all` in `api/main.py`).
-- **Weather-variable grid**: `nowcast/processing/weather_fields.py` — real ECMWF Open Data
-  (HRES forecast, 0.25°, updated 4x/day) via `nowcast/ingestion/ecmwf_weather.py` when
-  `USE_LIVE_ECMWF=true`. Genuinely free, **no API key needed** — ECMWF's older key-based
-  public-datasets service (`api.ecmwf.int`) was mostly decommissioned in 2023, so this uses
-  their newer unauthenticated Open Data service instead. Falls back to the synthetic
-  climatology+storm-perturbation grid on any failure.
-- **Fusion (§3)**: `nowcast/processing/fusion.py` — regrids and stacks
-  `[tir1, wv, mwir, reflectivity, lightning_prob]` into one multi-channel raster,
-  rolling buffer scaffold included.
-- **pySTEPS baseline (4a)**: `nowcast/models/pysteps_baseline.py` — real Lucas-Kanade
-  optical flow + semi-Lagrangian extrapolation, 0-6h at 10-min steps, on the synthetic
-  reflectivity sequence.
-- **Hazard rules (4c)**, all rule-based with documented thresholds in
-  `nowcast/configs/settings.py`:
-  - Hail: `nowcast/models/hazard.py:hail_cells` — reflectivity + cold cloud top +
-    lightning, collocated on the fusion grid.
-  - Downburst: `nowcast/models/hazard.py:downburst_cells` — radial-velocity couplet
-    magnitude via local max/min filter.
-  - Cloudburst: `nowcast/models/pysteps_baseline.py:cloudburst_cells` — pySTEPS
-    extrapolated rain rate vs. IMD's very-heavy-rain threshold.
-  - Lightning: IMD probability category thresholds.
-- **ETA/motion**: `nowcast/models/eta.py` — bearing/speed derived from the same pySTEPS
-  Lucas-Kanade field, not a separate model.
-- **DGMR deep model (4b, stretch goal)**: `nowcast/models/dgmr_nowcast.py` — DeepMind's
-  pretrained Skillful Nowcasting GAN (`openclimatefix/dgmr`), real weights, run zero-shot
-  on CPU (~3-11s/forecast). Output is a documented unitless relative-intensity field, not
-  calibrated mm/hr (UK-radar domain shift on synthetic input) — see the module docstring
-  and `WRITEUP.md` for why, and why it's never fed into the cloudburst hazard rule.
-- **API**: `nowcast/api/main.py` — `/hazards` (lead-time aware, all 4 hazard types),
-  `/storm-eta`, `/forecast?model=pysteps|dgmr`, `/nowcast-frame?model=...&lead_time=...`
-  (single-frame PNG for the model comparison toggle), `/raw-layers` (satellite IR + radar
-  reflectivity as real PNG image overlays), `/health`.
-- **Real GIS layers** (`nowcast/dashboard/src/lib/mosdacLayers.ts`): 16 overlay layers
-  (LULC, basins, drainage, landslide/fire risk, rivers, roads, railways, airports,
-  admin/taluka boundaries, district population) and 7 base layers (Bhuvan Maps, OSM, DEM,
-  LULC, Natural Earth, Black/True Marble) — genuine ISRO/NRSC/MOSDAC WMS data. Sourced by
-  driving MOSDAC's live CloudBurst DSS (`mosdac.gov.in/cloudburst/`) with a real browser
-  and capturing each layer's actual WMS request; every layer verified with a direct
-  GetMap request returning HTTP 200 + a real image before being wired in. Bhuvan's WMS
-  has no CORS headers, so it's routed through `/wms-proxy/bhuvan` on our own backend.
-- **Dashboard** (`nowcast/dashboard/`, React + TypeScript + Vite — see its own README):
-  real basemap (Esri dark-gray canvas, no API key needed) with the real GIS layers above
-  selectable as alternate base maps or toggleable overlays, heatmap-based hazard rendering
-  (not stacked point markers), station markers with popups, a pySTEPS/DGMR model-comparison
-  toggle, temperature/humidity/wind overlays across a wider region, click-to-inspect a
-  region (dashed selection box, zoom, and a user-controlled 0-6h future-trend panel with
-  its own chart), live countdown clocks, lead-time slider, legend. The original single-file
-  HTML/JS version is kept at `nowcast/dashboard/legacy/index.html` for reference but is
-  no longer maintained. Verified with a headless-browser pass (Playwright) — see below.
+## Table of Contents
 
-Not built: real Doppler velocity for downburst (no public source exists outside
-MOSDAC/IMD), SmaAt-UNet fine-tuning (the plan's Option B for 4b — DGMR zero-shot,
-Option A, was built instead).
+* [Overview](#overview)
+* [Live Dashboard](#live-dashboard)
+* [Architecture](#architecture)
+* [Data Sources](#data-sources)
+* [Features](#features)
+* [Pipeline](#pipeline)
+* [Hazard Detection](#hazard-detection)
+* [Models](#models)
+* [API Reference](#api-reference)
+* [GIS Layers](#gis-layers)
+* [SMS Alerting](#sms-alerting)
+* [Technology Stack](#technology-stack)
+* [Getting Started](#getting-started)
+* [Configuration](#configuration)
+* [Repository Structure](#repository-structure)
+* [Limitations](#limitations)
+* [License](#license)
 
-## Run it
+---
 
-Backend:
+## Overview
+
+**MeghDrishti** ("Cloud Vision" in Sanskrit) is a full-stack, real-time convective storm nowcasting platform built for Smart India Hackathon 2026. It autonomously ingests multi-source geospatial data — IMD radar reflectivity, satellite thermal imagery, lightning strikes, and ECMWF weather grids — fuses them into a unified multi-channel raster, and runs rule-based hazard detection alongside two deep/statistical nowcasting models (pySTEPS and DGMR).
+
+The system's **default hazard view detects real hail and lightning across all of India right now** — no fixed demo city, no synthetic storm — using live RainViewer radar data (IMD's own network, republished) and Blitzortung.org lightning strikes. A second per-region mode powers the Forecast and Replay pages with pySTEPS/DGMR model comparison across 10 major Indian cities.
+
+---
+
+## Live Dashboard
+
+The React + TypeScript dashboard runs at `http://localhost:5173` and communicates with the FastAPI backend at `http://localhost:8000`.
+
+<p align="center">
+  <img src="assets/dashboard_hazards.png" width="48%" style="border-radius:10px; margin:1%;"/>
+  <img src="assets/dashboard_forecast.png" width="48%" style="border-radius:10px; margin:1%;"/>
+</p>
+<p align="center">
+  <img src="assets/dashboard_layers.png" width="48%" style="border-radius:10px; margin:1%;"/>
+  <img src="assets/dashboard_replay.png" width="48%" style="border-radius:10px; margin:1%;"/>
+</p>
+
+---
+
+## Architecture
+
+```
+                   +---------------------------------------+
+                   |           Data Ingestion              |
+                   |  +------------+  +-----------------+  |
+                   |  | RainViewer |  | Blitzortung.org |  |
+                   |  | (Radar dBZ)|  | (Lightning MQTT)|  |
+                   |  +-----+------+  +-------+---------+  |
+                   |  +-----+-----------------------------+ |
+                   |  | Copernicus Sentinel-3 / EUMETSAT  | |
+                   |  |        (Satellite IR TIR-1)       | |
+                   |  +-----------------------------------+ |
+                   |  +-----------------------------------+ |
+                   |  |   ECMWF Open Data (No API Key)    | |
+                   |  |  0.25 deg HRES, 4x/day, CC-BY-4  | |
+                   |  +-----------------------------------+ |
+                   +------------------+--------------------+
+                                      |
+                   +------------------v--------------------+
+                   |            Fusion Engine              |
+                   |   Multi-channel raster stack:         |
+                   |   [tir1, wv, mwir, dBZ, lightning]   |
+                   +---+---------------+---------------+---+
+                       |               |               |
+              +--------v------+ +------v------+ +------v------+
+              | Rule-Based    | |  pySTEPS    | |    DGMR     |
+              | Hazard Engine | | (LK Optical | | (DeepMind   |
+              | Hail/Lightn.  | |  Flow+Extrap| |  Pretrained)|
+              +--------+------+ +------+------+ +------+------+
+                       |               |               |
+                       +---------------v---------------+
+                                       |
+                       +---------------v-----------------+
+                       |    FastAPI Backend (:8000)      |
+                       |  /hazards  /forecast            |
+                       |  /raw-layers  /weather-layers   |
+                       |  /nowcast-frame  /storm-eta     |
+                       +---------------+-----------------+
+                                       |
+                       +---------------v-----------------+
+                       |  React + TypeScript (:5173)     |
+                       |  MapLibre GL - Heatmap hazards  |
+                       |  MOSDAC WMS - 23 GIS layers     |
+                       |  pySTEPS vs DGMR toggle         |
+                       +---------------------------------+
+```
+
+---
+
+## Data Sources
+
+MeghDrishti uses **five real, free data sources** as opt-in live paths (each behind a `USE_LIVE_*` flag in `.env`), falling back to synthetic mock data automatically if any source is unavailable:
+
+| Layer | Real Source | API Key | Notes |
+|---|---|---|---|
+| **Radar Reflectivity** | RainViewer | None | IMD radar network, republished. Genuine greyscale-to-dBZ decode |
+| **Lightning Strikes** | Blitzortung.org | None | Free community VLF network, MQTT-streamed |
+| **Station Weather** | Tomorrow.io | Free tier | Temp/humidity/wind/precip at 10 demo stations |
+| **Weather Grid** | ECMWF Open Data | None | 0.25 deg HRES, 4x/day, CC-BY-4.0 |
+| **Satellite IR** | Copernicus Sentinel-3 SLSTR | Free CDSE | Verified live; polar orbit (~1-2 passes/day) |
+| **Satellite IR (alt)** | EUMETSAT MSG SEVIRI | Free | Geostationary, 15min updates; wired, pending 403 fix |
+| **Hail + Lightning (default)** | Real, all of India | None | `hazard_india.py`: RainViewer + Blitzortung, zero synthetic |
+
+> **Radar velocity (downburst)** has no free public equivalent — no aggregator exposes raw Doppler volumetric scans — so it remains synthetic.
+
+---
+
+## Features
+
+- **All-India Real Hazard View** — hail and lightning detected across India in real time via RainViewer + Blitzortung. Not scoped to a demo city.
+
+- **Four Hazard Types** — hail (reflectivity + cold cloud top + lightning collocated), downburst (radial velocity couplet), cloudburst (pySTEPS rain rate >= 15 mm/hr), and lightning (IMD probability categories).
+
+- **Multi-Model Nowcasting** — pySTEPS Lucas-Kanade optical flow (0-6h, calibrated mm/hr) and DeepMind DGMR (0-90min, real pretrained weights) with a live comparison toggle.
+
+- **Multi-Source Fusion** — `[tir1, wv, mwir, reflectivity_dbz, lightning_prob]` stacked into one unified multi-channel raster per ingest cycle.
+
+- **23 Real ISRO/MOSDAC GIS Layers** — 16 overlays (LULC, basins, drainage, landslide risk, rivers, roads, airports, district boundaries) + 7 base maps (Bhuvan, OSM, DEM, Natural Earth, Black Marble). Sourced live from MOSDAC CloudBurst DSS.
+
+- **10 Selectable Demo Regions** — Pune, Delhi, Mumbai, Chennai, Kolkata, Bengaluru, Hyderabad, Ahmedabad, Jaipur, Guwahati — pre-warmed in the background so region switches are instant.
+
+- **Storm-Arrival Countdown** — ETA derived from pySTEPS Lucas-Kanade motion field, not a separate model.
+
+- **Weather Overlays** — real-time temperature, humidity, wind speed, pressure, and rain rate across the whole of India; lead-time animatable alongside the nowcast slider.
+
+- **Convective Risk Index (P1)** — composite score overlaying cloudburst + hail + lightning contributions in a single magma-colormapped raster.
+
+- **SMS Alerts** — Twilio-powered hazard alerts to configured numbers when a district hits the severity threshold, with per-district cooldown.
+
+- **Background Pre-Warm** — all 10 region snapshots kept warm by a background thread so `/regions/{key}` switches apply instantly.
+
+---
+
+## Pipeline
+
+End-to-end execution triggered on startup and every `INGEST_CYCLE_MINUTES` (default 15):
+
+```
+1. Ingestion (parallel, failure-isolated)
+   +-- imd_nowcast.py         -> station temp/humidity/wind (Tomorrow.io or synthetic)
+   +-- satellite_insat.py     -> satellite tir1 (Copernicus -> synthetic fallback)
+   +-- radar_puller.py        -> radar reflectivity (RainViewer or synthetic Gaussian cell)
+
+2. Lightning (independent of above)
+   +-- blitzortung_lightning.py -> real VLF strikes over ~6s listen window
+
+3. Fusion
+   +-- fusion.py -> regrid + stack all channels into one multi-channel raster
+
+4. Hazard Detection
+   +-- hazard_india.py  -> all-India hail + lightning (default /hazards endpoint)
+   +-- hazard.py        -> per-region hail/downburst on fused raster
+
+5. Nowcasting
+   +-- pysteps_baseline.py -> LK optical flow + semi-Lagrangian extrapolation
+   +-- dgmr_nowcast.py     -> DeepMind DGMR (lazy-loaded on first /forecast?model=dgmr)
+
+6. Weather Grid
+   +-- weather_fields.py -> ECMWF Open Data regridded to India bbox (or synthetic)
+
+7. Serve via FastAPI
+   +-- api/main.py -> all endpoints, cached per cycle, CORS-enabled
+```
+
+---
+
+## Hazard Detection
+
+All hazard rules use physically motivated, documented thresholds from `nowcast/configs/settings.py`:
+
+| Hazard | Rule | Threshold |
+|---|---|---|
+| **Hail** | Reflectivity AND TIR-1 AND lightning prob, all collocated | >= 55 dBZ, <= 210K, >= 0.30 |
+| **Downburst** | Radial velocity delta (max-min in 5-cell window) | >= 25 m/s |
+| **Cloudburst** | pySTEPS-extrapolated rain rate | >= 15 mm/hr (IMD "very heavy rain") |
+| **Lightning** | IMD probability category | Cat11/Cat19 boundaries |
+
+The all-India view uses `hazard_india.py` which runs hail and lightning rules over the full country-scale reflectivity grid — approximately 200x200 cells covering 68E-97.5E, 6.5N-37N.
+
+Hazard points are **advected** at requested lead times using real ECMWF wind vectors (storms roughly follow the steering flow) — not re-detected at a future time.
+
+---
+
+## Models
+
+### pySTEPS (Baseline, Section 4a)
+
+Lucas-Kanade optical flow + semi-Lagrangian extrapolation on the synthetic reflectivity sequence. Produces **0-6h forecast at 10-minute steps** in calibrated mm/hr. Used to drive the cloudburst hazard rule and lead-time slider.
+
+### DGMR (Stretch Goal, Section 4b)
+
+DeepMind's pretrained **Skillful Precipitation Nowcasting GAN** (`openclimatefix/dgmr` on HuggingFace), run **zero-shot on CPU** (~3-11s/forecast). Real weights, no fine-tuning. Produces 0-90min relative intensity frames.
+
+> **Important:** DGMR was trained on UK Met Office radar. Its output over Indian/synthetic input is **unitless 0-1 relative intensity**, not calibrated mm/hr. It is shown as a visual comparison layer only and never fed into the cloudburst hazard rule. This is the explicit domain-shift limitation the plan asks to disclose.
+
+### SmaAt-UNet (Planned, Section 4b Option B)
+
+Architecture implemented in `nowcast/models/smaat_unet.py` and training scaffold in `train_smaat.py`. Not yet fine-tuned on Indian radar data — DGMR zero-shot was built instead.
+
+---
+
+## API Reference
+
+The FastAPI backend exposes the following endpoints at `http://localhost:8000`:
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/hazards` | GET | Real hail + lightning across all India. `?lead_time=N` advects by ECMWF wind |
+| `/hazards/region` | GET | Per-region demo: all 4 hazard types, pySTEPS-backed cloudburst |
+| `/forecast` | GET | Nowcast summary. `?model=pysteps or dgmr or smaat` |
+| `/nowcast-frame` | GET | Single PNG overlay frame. `?model=...&lead_time=N` |
+| `/raw-layers` | GET | Satellite IR + radar reflectivity as base64 PNG overlays |
+| `/weather-layers` | GET | Temp/humidity/wind/pressure/rainfall/risk grids. `?lead_time=N` |
+| `/wind-vectors` | GET | Sparse wind arrow points for symbol rendering |
+| `/storm-eta` | GET | Storm motion cells with bearing + speed from pySTEPS LK field |
+| `/region-forecast` | GET | Point-sampled weather trend at `?lat=&lon=&lead_time=N` |
+| `/regions` | GET | List selectable demo regions |
+| `/regions/{key}` | POST | Switch active demo region (instant from pre-warm cache) |
+| `/wms-proxy/bhuvan` | GET | CORS proxy for Bhuvan WMS |
+| `/health` | GET | Health check |
+
+Full interactive docs at `http://localhost:8000/docs`.
+
+---
+
+## GIS Layers
+
+MeghDrishti integrates **23 genuine ISRO/NRSC/MOSDAC WMS layers**, sourced by driving MOSDAC's live CloudBurst DSS with a real browser and capturing each layer's actual WMS request:
+
+**7 Base Maps:** Bhuvan Maps, OSM, DEM, LULC, Natural Earth, Black Marble, True Marble
+
+**16 Overlay Layers:** LULC, River Basins, Drainage, Landslide Risk, Fire Risk, Rivers, Roads, Railways, Airports, Administrative Boundaries, Taluka Boundaries, District Population, and more
+
+> Bhuvan's WMS server sends no CORS headers, so it is routed through a same-origin backend proxy at `/wms-proxy/bhuvan` — discovered and fixed during live browser verification with Playwright.
+
+---
+
+## SMS Alerting
+
+When any district's real-time hazard rollup hits the configured severity threshold (`ALERT_MIN_SEVERITY`, default `"high"`), the system sends a Twilio SMS alert to all configured `ALERT_TO_NUMBERS`.
+
+- Per-district cooldown (`ALERT_COOLDOWN_MINUTES`, default 60 min) prevents spam
+- Alert send failures are isolated — a Twilio outage never affects hazard detection
+- Configured via `.env`: `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER`, `ALERT_TO_NUMBERS`
+
+---
+
+## Technology Stack
+
+| Component | Technology |
+|---|---|
+| Backend Runtime | Python 3.11 |
+| API Framework | FastAPI + Uvicorn |
+| Nowcasting (Baseline) | pySTEPS (Lucas-Kanade + Semi-Lagrangian) |
+| Nowcasting (Deep) | DGMR (DeepMind, HuggingFace) |
+| Radar Data | RainViewer (IMD network, greyscale-to-dBZ) |
+| Lightning Data | Blitzortung.org (MQTT, community VLF) |
+| Satellite Data | Copernicus Sentinel-3 SLSTR / EUMETSAT MSG |
+| Weather Grid | ECMWF Open Data (0.25 deg HRES, free) |
+| Station Weather | Tomorrow.io Realtime API |
+| SMS Alerts | Twilio |
+| Frontend | React 18 + TypeScript + Vite |
+| Map Rendering | MapLibre GL JS |
+| GIS Layers | ISRO/NRSC/MOSDAC WMS (23 layers) |
+| Numerical | NumPy, SciPy, PyTorch |
+| Visualization | Matplotlib, Pillow |
+
+---
+
+## Getting Started
+
+### Prerequisites
+
+- Python 3.11
+- Node.js 18+
+- A `.env` file (copy from `.env.example`)
+
+### Backend
+
 ```bash
+git clone https://github.com/AdityaShome/MeghDrishti.git
+cd MeghDrishti
+
+# Create and activate virtual environment
+python -m venv .venv
+source .venv/bin/activate       # Linux/macOS
+.venv\Scripts\activate          # Windows
+
+# Install dependencies
 pip install -r requirements.txt
+
+# Copy and configure environment
+cp .env.example .env
+# Edit .env -- all USE_LIVE_* flags default to false (synthetic mode, no API calls)
+
+# Start the backend
 uvicorn nowcast.api.main:app --port 8000
 ```
-On startup it runs all three pullers once, fuses them, and serves immediately; it then
-re-ingests + recomputes every `INGEST_CYCLE_MINUTES` (15 by default).
 
-**Don't add `--reload` for normal use** — this app continuously writes its own timestamped
-data files into `nowcast/data/` (every ingest cycle, every region pre-warm), and uvicorn's
-reloader watches the whole project directory by default. With `--reload` on, every one of
-those writes looks like a source-code change and restarts the entire server mid-cycle,
-which surfaces as `cannot schedule new futures after interpreter shutdown` errors from
-whatever background fetch happened to be in flight — a genuine bug from `--reload`
-fighting the app, not an app bug itself. If you're actively editing backend Python and
-want `--reload`, exclude the data directory: `--reload --reload-exclude "nowcast/data/*"`.
+> **Note:** Do not use `--reload` for normal use. The server writes timestamped data files to `nowcast/data/` on every ingest cycle, and uvicorn's reloader restarts the server on each write. If you need `--reload` while editing:
+>
+> ```bash
+> uvicorn nowcast.api.main:app --port 8000 --reload --reload-exclude "nowcast/data/*"
+> ```
 
-Dashboard:
+### Frontend (Dashboard)
+
 ```bash
 cd nowcast/dashboard
 npm install
 npm run dev
 ```
-Opens at `http://localhost:5173` and talks to the backend at `http://localhost:8000`.
 
-## Verification
+Opens at `http://localhost:5173` and proxies API calls to `http://localhost:8000`.
 
-Endpoints were hit live and the dashboard was driven with Playwright (headless Chromium)
-to confirm: map loads, all 4 hazard types render simultaneously and colocate on one
-storm, satellite/radar PNG overlays render, the countdown clock actually ticks down in
-real time, and the lead-time slider correctly advects the cloudburst layer via pySTEPS
-while leaving the "now"-only hazards (hail/downburst/lightning) in place. Zero console
-errors. Two real bugs were caught this way and fixed:
-- pySTEPS' synthetic history window and the "now" snapshot didn't share a time origin,
-  silently offsetting every forecast label by ~50 minutes.
-- In the React rewrite, `MapProvider`'s map container and the rest of the UI ended up as
-  DOM *siblings* instead of nested (because a Context.Provider renders no element of its
-  own), and separately MapLibre's own stylesheet was overriding the container's
-  `position: absolute` with its own `position: relative` on class-selector import-order —
-  together these collapsed the map to zero height and silently ate every click. Fixed by
-  moving the shell wrapper into `MapProvider` and setting position via inline style.
-- Bhuvan's WMS ("Bhuvan Maps" base layer) returned a real tile via `curl` but failed
-  silently in-browser — its server sends no CORS headers, so MapLibre's fetch-based tile
-  loader was blocked. Confirmed by checking the actual error text (not just "tiles didn't
-  load") and fixed with a same-origin backend proxy rather than dropping the layer.
+---
 
-## Next steps (in plan order)
+## Configuration
 
-1. MOSDAC/IMD nowcast API registration is submitted and under review (project.md section
-   1) — once granted, swap `radar_puller.py`'s velocity over to a real MOSDAC source;
-   everything else already has a real stand-in (see above).
-2. Copernicus satellite integration (`copernicus_satellite.py`) is registered and
-   verified live — real Sentinel-3 SLSTR brightness temperature confirmed across
-   multiple regions. EUMETSAT MSG SEVIRI (`eumetsat_satellite.py`) is also wired in as
-   a continuous-coverage companion (geostationary, updates every 15min, actually
-   centered on India, vs Sentinel-3's ~1-2 passes/day) and tried first when both are
-   configured — written against `eumdac`'s real, introspected API surface, but **not
-   yet exercised against live credentials**, so it may need debugging once
-   `EUMETSAT_CONSUMER_KEY`/`SECRET` are set.
-3. Once real radar CAPPI grids or RainViewer's live feed have been observed against
-   actual storms, downburst/hail thresholds should be re-validated — the current
-   thresholds are textbook values, never checked against data.
-4. Remaining stretch goals: multi-region coverage; historical validation against Bhuvan
-   LDSN; SmaAt-UNet fine-tuning as a second deep-model comparison alongside DGMR.
+All configuration is via environment variables. Copy `.env.example` to `.env`:
+
+| Variable | Required | Description |
+|---|---|---|
+| `USE_LIVE_RADAR` | No | `true` to use real RainViewer reflectivity (no key needed) |
+| `USE_LIVE_LIGHTNING` | No | `true` to use real Blitzortung.org lightning (no key needed) |
+| `USE_LIVE_ECMWF` | No | `true` to use real ECMWF Open Data weather grid (no key needed) |
+| `USE_LIVE_IMD` | No | `true` to use real Tomorrow.io station weather |
+| `TOMORROW_API_KEY` | Conditional | Required if `USE_LIVE_IMD=true` |
+| `USE_LIVE_SATELLITE` | No | `true` to use real Copernicus Sentinel-3 SLSTR |
+| `COPERNICUS_CLIENT_ID` | Conditional | Required if `USE_LIVE_SATELLITE=true` |
+| `COPERNICUS_CLIENT_SECRET` | Conditional | Required if `USE_LIVE_SATELLITE=true` |
+| `EUMETSAT_CONSUMER_KEY` | Optional | EUMETSAT MSG SEVIRI (tried first if configured) |
+| `EUMETSAT_CONSUMER_SECRET` | Optional | EUMETSAT MSG SEVIRI |
+| `TWILIO_ACCOUNT_SID` | Optional | For SMS hazard alerts |
+| `TWILIO_AUTH_TOKEN` | Optional | For SMS hazard alerts |
+| `TWILIO_FROM_NUMBER` | Optional | Twilio-registered sender number |
+| `ALERT_TO_NUMBERS` | Optional | Comma-separated recipient numbers |
+| `ALERT_MIN_SEVERITY` | No | `low`, `moderate`, or `high` (default: `high`) |
+| `ALERT_COOLDOWN_MINUTES` | No | Alert re-send cooldown per district (default: `60`) |
+| `INGEST_CYCLE_MINUTES` | No | Background refresh cadence (default: `15`) |
+
+> All `USE_LIVE_*` flags default to `false` — the system runs fully on synthetic data out of the box with no external network calls.
+
+---
+
+## Repository Structure
+
+```text
+.
++-- nowcast/
+|   +-- alerts/
+|   |   +-- sms_alerts.py               # Twilio SMS alert integration
+|   +-- api/
+|   |   +-- main.py                     # FastAPI entrypoint, all endpoints, caching
+|   +-- configs/
+|   |   +-- districts_india.py          # ~130 Indian district centroids + vectorized lookup
+|   |   +-- settings.py                 # Hazard thresholds, regions, env flags
+|   +-- dashboard/                      # React + TypeScript + Vite frontend
+|   |   +-- src/
+|   |   |   +-- components/             # HazardsPage, ForecastPage, ReplayPage, etc.
+|   |   |   +-- map/                    # MapLibre GL layers (hazards, radar, WMS)
+|   |   |   +-- lib/
+|   |   |       +-- mosdacLayers.ts     # All 23 ISRO/MOSDAC WMS layer definitions
+|   |   +-- legacy/
+|   |       +-- index.html              # Original single-file HTML/JS (reference)
+|   +-- ingestion/
+|   |   +-- imd_nowcast.py              # Tomorrow.io station feed + Blitzortung
+|   |   +-- blitzortung_lightning.py    # Real VLF lightning via MQTT
+|   |   +-- rainviewer_radar.py         # Real all-India radar via RainViewer
+|   |   +-- satellite_insat.py          # Satellite orchestrator (EUMETSAT -> Copernicus)
+|   |   +-- eumetsat_satellite.py       # EUMETSAT MSG SEVIRI (geostationary)
+|   |   +-- copernicus_satellite.py     # Copernicus Sentinel-3 SLSTR (verified live)
+|   |   +-- ecmwf_weather.py            # ECMWF Open Data HRES (no key)
+|   |   +-- radar_puller.py             # Radar orchestrator
+|   +-- models/
+|   |   +-- hazard.py                   # Per-region hail/downburst rules on fused raster
+|   |   +-- hazard_india.py             # All-India hail+lightning on country-scale grid
+|   |   +-- pysteps_baseline.py         # LK optical flow + semi-Lagrangian, cloudburst
+|   |   +-- dgmr_nowcast.py             # DeepMind DGMR zero-shot (real pretrained weights)
+|   |   +-- smaat_unet.py               # SmaAt-UNet architecture (not yet fine-tuned)
+|   |   +-- train_smaat.py              # Training scaffold for SmaAt-UNet
+|   |   +-- eta.py                      # Storm ETA from pySTEPS LK motion field
+|   +-- processing/
+|       +-- fusion.py                   # Multi-channel raster stack + rolling buffer
+|       +-- storm_track.py              # Canonical synthetic storm trajectory
+|       +-- weather_fields.py           # ECMWF regrid + synthetic ambient fields
+|       +-- synthetic_radar.py          # Gaussian cell mock for fallback
+|       +-- backtest.py                 # Historical replay framework
+|       +-- load_historical_replay.py   # Historical data loader
++-- test_backend.py                     # Integration tests for all API endpoints
++-- requirements.txt
++-- .env.example
++-- WRITEUP.md                          # One-page technical write-up
++-- project.md                          # Full project plan (SIH 2026)
+```
+
+---
+
+## Limitations
+
+- **Radar velocity** (downburst): no public free source exposes raw Doppler volumetric scans. Downburst stays fully synthetic even with all live flags enabled.
+- **DGMR calibration**: domain shift from UK Met Office training data means output is unitless relative intensity, not mm/hr. Never used for the cloudburst hazard rule.
+- **Satellite revisit**: Copernicus Sentinel-3 is polar-orbiting (~1-2 passes/day); frequent "no recent scene over this bbox" fallbacks to synthetic are expected, not bugs.
+- **Processing scale**: pySTEPS extrapolation runs on a ~64x64 demo bbox, degrading after ~2 simulated hours as the storm exits. The all-India hazard view runs at RainViewer mosaic resolution.
+- **Hazard thresholds**: textbook meteorological values, never validated against a real Indian convective event.
+- **SmaAt-UNet**: architecture implemented, training scaffold ready, but no fine-tuning on Indian/SEVIR radar data yet.
+
+---
+
+## License
+
+MIT License. See [LICENSE](LICENSE) for more information.
+
+---
+
+<p align="center">Built for <b>Smart India Hackathon 2026</b></p>
